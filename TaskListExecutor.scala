@@ -2,27 +2,24 @@ package opinov8.anyware.actors
 
 import akka.actor.{Actor, ActorLogging, ActorRef}
 import akka.pattern.pipe
-
 import scala.concurrent.Future
-import scala.reflect.{ClassTag, classTag}
+
+object TaskListExecutor {
+  object Start
+}
 
 trait TaskListExecutor extends ActorLogging { this: Actor =>
   type IdleState
   type TaskItem
   type TaskExecutionResult
-  implicit val classTagOfTaskItem: ClassTag[TaskItem] = classTag[TaskItem]
-  implicit val classTagOfTaskExecutionResult: ClassTag[TaskExecutionResult] = classTag[TaskExecutionResult]
 
   case class TaskListExecutionDone(taskExecutionResults: Seq[TaskExecutionResult])
 
-  private object Messages {
-    object Start
-    case class GotTaskList(taskList: Seq[TaskItem])
-    case class GotTaskListFailed(t: Throwable)
-    object PlaceNextTask
-    case class TaskItemDone(taskItem: TaskItem, taskExecutionResult: TaskExecutionResult)
-    case class TaskItemFailed(taskItem: TaskItem, t: Throwable)
-  }
+  private case class GotTaskList(taskList: Seq[TaskItem])
+  private case class GotTaskListFailed(t: Throwable)
+  private object PlaceNextTask
+  private case class TaskItemDone(taskExecutionResult: TaskExecutionResult)
+  private case class TaskItemFailed(t: Throwable)
 
   def initState: IdleState
   def getTaskList(idleState: IdleState): Future[Seq[TaskItem]]
@@ -31,14 +28,13 @@ trait TaskListExecutor extends ActorLogging { this: Actor =>
   def executeTask(taskItem: TaskItem): Future[TaskExecutionResult]
 
   import context._
-  import Messages._
 
   var startSender: Option[ActorRef] = None
 
   override def receive: Receive = idle(initState)
 
   def idle(idleState: IdleState): Receive = {
-    case Start => {
+    case TaskListExecutor.Start => {
       startSender = Some(sender())
       become(waitingTasks(idleState))
       getTaskList(idleState)
@@ -50,7 +46,7 @@ trait TaskListExecutor extends ActorLogging { this: Actor =>
 
   def waitingTasks(idleState: IdleState): Receive = {
     case GotTaskList(taskList) => {
-      become(processTasks(taskList.toList, Seq[TaskItem](), Seq[TaskExecutionResult](), updateIdleState(idleState)))
+      become(processTasks(taskList.toList, 0, Seq[TaskExecutionResult](), updateIdleState(idleState)))
       for (_ <- 1 to concurrency)
         self ! PlaceNextTask
     }
@@ -60,31 +56,31 @@ trait TaskListExecutor extends ActorLogging { this: Actor =>
     }
   }
 
-  def processTasks(pendingTasks: List[TaskItem], processingTasks: Seq[TaskItem], taskExecutionResults: Seq[TaskExecutionResult], idleState: IdleState): Receive = {
+  def processTasks(pendingTasks: List[TaskItem], processingTasks: Int, taskExecutionResults: Seq[TaskExecutionResult], idleState: IdleState): Receive = {
     case PlaceNextTask => {
-      if(pendingTasks.isEmpty && processingTasks.isEmpty) {
-        startSender map (_ ! TaskListExecutionDone(taskExecutionResults))
-        become(idle(idleState))
-      } else {
-        pendingTasks match {
-          case taskItem :: pendingTasksTail => {
-            executeTask(taskItem)
-              .map(taskExecutionResult => TaskItemDone(taskItem, taskExecutionResult))
-              .recover{ case t: Throwable => TaskItemFailed(taskItem, t) }
-              .pipeTo(self)
-            become(processTasks(pendingTasksTail, processingTasks :+ taskItem, taskExecutionResults, idleState))
+      pendingTasks match {
+        case taskItem :: pendingTasksTail => {
+          become(processTasks(pendingTasksTail, processingTasks + 1, taskExecutionResults, idleState))
+          executeTask(taskItem)
+            .map(TaskItemDone(_))
+            .recover{ case t: Throwable => TaskItemFailed(t) }
+            .pipeTo(self)
+        }
+        case Nil => {
+          if(processingTasks <= 0) {
+            startSender map (_ ! TaskListExecutionDone(taskExecutionResults))
+            become(idle(idleState))
           }
-          case Nil =>
         }
       }
     }
-    case TaskItemDone(taskItem: TaskItem, taskExecutionResult: TaskExecutionResult) => {
-      become(processTasks(pendingTasks, processingTasks.filterNot(_ == taskItem), taskExecutionResults :+ taskExecutionResult, idleState))
+    case TaskItemDone(taskExecutionResult) => {
+      become(processTasks(pendingTasks, processingTasks - 1, taskExecutionResults :+ taskExecutionResult, idleState))
       self ! PlaceNextTask
     }
-    case TaskItemFailed(taskItem: TaskItem, t: Throwable) => {
-      log.error(t, s"Error executing task $taskItem")
-      become(processTasks(pendingTasks, processingTasks.filterNot(_ == taskItem), taskExecutionResults, idleState))
+    case TaskItemFailed(t) => {
+      log.error(t, s"Error executing task")
+      become(processTasks(pendingTasks, processingTasks - 1, taskExecutionResults, idleState))
       self ! PlaceNextTask
     }
   }
